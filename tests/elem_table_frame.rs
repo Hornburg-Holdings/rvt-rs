@@ -18,6 +18,10 @@
 //!
 //! Corpus resolution follows `tests/elem_table_corpus.rs`: a configured but
 //! incomplete corpus fails, an absent one skips and says so.
+//!
+//! `RVT_ELEM_TABLE_REMAP_DIR` optionally supplies a flat directory of private
+//! real `.rvt` files with remapped primary ids and secondary-sorted 40-byte
+//! tables. It must contain at least one such file; no file is redistributed.
 
 mod common;
 
@@ -143,5 +147,89 @@ fn project_tables_hold_every_stated_record() {
     }
     if read == 0 {
         eprintln!("skipping: RVT_PROJECT_CORPUS_DIR is not set");
+    }
+}
+
+#[test]
+fn remapped_tables_keep_the_full_count_and_secondary_order() {
+    let Some(dir) = std::env::var_os("RVT_ELEM_TABLE_REMAP_DIR").map(PathBuf::from) else {
+        eprintln!("skipping: RVT_ELEM_TABLE_REMAP_DIR is not set");
+        return;
+    };
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("RVT_ELEM_TABLE_REMAP_DIR {}: {e}", dir.display()))
+        .map(|entry| entry.expect("read remapped-table corpus entry").path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rvt"))
+        })
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "RVT_ELEM_TABLE_REMAP_DIR {} contains no real .rvt files",
+        dir.display()
+    );
+    for path in files {
+        let label = path.display().to_string();
+        let count = stated_count(&path);
+        let mut rf = RevitFile::open(&path).expect("open remapped-table file");
+        let header = elem_table::parse_header(&mut rf).expect("remapped-table header");
+        let layout = elem_table::read_layout(&mut rf).expect("remapped-table layout");
+        let records = elem_table::parse_records(&mut rf).expect("remapped-table records");
+
+        assert_eq!(
+            header.record_count as usize, count,
+            "{label}: full u32 count"
+        );
+        assert_eq!(layout.start, 0x06, "{label}: record origin");
+        assert_eq!(layout.stride, 40, "{label}: explicit record size");
+        assert_eq!(
+            layout.framing,
+            elem_table::RecordFraming::Explicit { marker_len: 8 },
+            "{label}: explicit owner field"
+        );
+        assert_eq!(records.len(), count, "{label}: every stated record is read");
+        assert!(
+            records
+                .windows(2)
+                .all(|w| w[0].id_secondary < w[1].id_secondary),
+            "{label}: secondary ElementIds rise strictly"
+        );
+        assert!(
+            records.iter().any(|r| r.id_primary != r.id_secondary),
+            "{label}: this regression requires remapped primary ids"
+        );
+        assert!(
+            records
+                .windows(2)
+                .any(|w| w[0].id_primary >= w[1].id_primary),
+            "{label}: this regression requires nonascending primary ids"
+        );
+
+        let secondary_ids: BTreeSet<u32> = records.iter().map(|r| r.id_secondary).collect();
+        assert_eq!(
+            secondary_ids.len(),
+            count,
+            "{label}: secondary ids are unique"
+        );
+        assert!(
+            records
+                .iter()
+                .filter_map(|r| r.owner_id)
+                .all(|owner| secondary_ids.contains(&owner)),
+            "{label}: every set owner is declared by a secondary id"
+        );
+        let declared = elem_table::declared_ids(&records);
+        assert!(
+            secondary_ids
+                .iter()
+                .filter(|&&id| id != 0)
+                .all(|id| declared.contains(id)),
+            "{label}: corrected framing retains declared secondary ElementIds"
+        );
     }
 }

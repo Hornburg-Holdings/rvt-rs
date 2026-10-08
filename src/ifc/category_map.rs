@@ -333,6 +333,13 @@ pub const MAPPINGS: &[Mapping] = &[
         ifc_type: "IFCDUCTSEGMENT",
         predefined_type: None,
     },
+    // A physical flexible duct retains its own class: the rigid-duct curve
+    // decoder's length/profile assumptions do not apply to its record box.
+    Mapping {
+        revit_class: "FlexDuct",
+        ifc_type: "IFCDUCTSEGMENT",
+        predefined_type: Some("FLEXIBLESEGMENT"),
+    },
     Mapping {
         revit_class: "DuctFitting",
         ifc_type: "IFCDUCTFITTING",

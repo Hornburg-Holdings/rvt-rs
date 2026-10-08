@@ -9,6 +9,11 @@ Guidance for AI coding agents working in the `rvt-rs` repository.
 2. **Python bindings** (`rvt-py/` + `python/`), built with `maturin` / `pyo3`.
 3. **WebAssembly browser viewer** (`viewer/`), built with `wasm-pack` + Vite.
 
+Customer model hashes, filenames, paths, authored values, element IDs and
+model-specific measurements must stay out of tracked files and public reports.
+Supply regression inputs through local environment variables and derive checks
+from the input instead of committing customer-specific expected results.
+
 ## Cursor Cloud specific instructions
 
 The Cloud Agent environment is defined by `.cursor/environment.json`, which runs

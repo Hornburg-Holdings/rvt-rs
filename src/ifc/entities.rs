@@ -164,6 +164,10 @@ pub enum IfcEntity {
     /// index into `IfcModel::entities`), beside its own `property_set`:
     /// a standard set such as `Pset_StairCommon` (RE-47).
     ElementPropertySet { element: usize, set: PropertySet },
+    /// Saved parameters of the Revit type identified by its ElementId.
+    /// The writer attaches these directly through `IfcTypeObject.HasPropertySets`;
+    /// occurrences inherit them through `IfcRelDefinesByType`.
+    TypePropertySet { type_id: u32, set: PropertySet },
     /// A join between two connectors (#528, RE-138): connector `a_index` of
     /// the building element at `a` (ElementId `a_id`), a duct or pipe, is
     /// connected to connector `b_index` of the element at `b` (ElementId
@@ -1505,7 +1509,7 @@ impl PropertyValue {
             PropertyValue::Label(s) => format!("IFCLABEL('{}')", escape_step_string(s)),
             PropertyValue::Identifier(s) => format!("IFCIDENTIFIER('{}')", escape_step_string(s)),
             PropertyValue::Integer(n) => format!("IFCINTEGER({n})"),
-            PropertyValue::Real(v) => format!("IFCREAL({v:.6})"),
+            PropertyValue::Real(v) => format!("IFCREAL({})", step_real(*v)),
             PropertyValue::Boolean(b) => {
                 format!("IFCBOOLEAN(.{}.)", if *b { "T" } else { "F" })
             }
@@ -1520,29 +1524,29 @@ impl PropertyValue {
             PropertyValue::LengthFeet(ft) => {
                 // Convert to metres at emit time (project length unit).
                 let metres = ft * 0.3048;
-                format!("IFCLENGTHMEASURE({metres:.6})")
+                format!("IFCLENGTHMEASURE({})", step_real(metres))
             }
             PropertyValue::PositiveLengthFeet(ft) => {
                 let metres = ft * 0.3048;
-                format!("IFCPOSITIVELENGTHMEASURE({metres:.6})")
+                format!("IFCPOSITIVELENGTHMEASURE({})", step_real(metres))
             }
-            PropertyValue::AngleRadians(r) => format!("IFCPLANEANGLEMEASURE({r:.6})"),
+            PropertyValue::AngleRadians(r) => format!("IFCPLANEANGLEMEASURE({})", step_real(*r)),
             PropertyValue::AreaSquareFeet(sqft) => {
                 // 1 ft² = 0.09290304 m² (exact, from international foot).
                 let sqm = sqft * 0.09290304;
-                format!("IFCAREAMEASURE({sqm:.6})")
+                format!("IFCAREAMEASURE({})", step_real(sqm))
             }
             PropertyValue::VolumeCubicFeet(cuft) => {
                 // 1 ft³ = 0.028316846592 m³ (exact).
                 let cum = cuft * 0.028316846592;
-                format!("IFCVOLUMEMEASURE({cum:.6})")
+                format!("IFCVOLUMEMEASURE({})", step_real(cum))
             }
             PropertyValue::CountValue(n) => format!("IFCCOUNTMEASURE({n})"),
-            PropertyValue::TimeSeconds(s) => format!("IFCTIMEMEASURE({s:.6})"),
+            PropertyValue::TimeSeconds(s) => format!("IFCTIMEMEASURE({})", step_real(*s)),
             PropertyValue::MassPounds(lb) => {
                 // 1 lb = 0.45359237 kg (exact, international avoirdupois pound).
                 let kg = lb * 0.45359237;
-                format!("IFCMASSMEASURE({kg:.6})")
+                format!("IFCMASSMEASURE({})", step_real(kg))
             }
             PropertyValue::List(items) => format!(
                 "({})",
@@ -1562,6 +1566,21 @@ impl PropertyValue {
             ),
         }
     }
+}
+
+/// Keep the existing six-place spelling when it preserves the value, otherwise
+/// use Rust's shortest round-tripping decimal. Small saved measurements must
+/// not become zero merely because property emission rounded them to six places.
+fn step_real(value: f64) -> String {
+    let fixed = format!("{value:.6}");
+    if fixed.parse::<f64>().ok() == Some(value) {
+        return fixed;
+    }
+    let mut text = value.to_string().replace('e', "E");
+    if !text.contains('.') && !text.contains('E') {
+        text.push('.');
+    }
+    text
 }
 
 /// Minimal STEP string escape — apostrophes doubled, backslashes

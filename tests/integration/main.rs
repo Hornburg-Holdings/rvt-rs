@@ -61,6 +61,8 @@ mod family_instance_ports;
 mod field_type_coverage;
 #[path = "../fitting_nominal_diameter.rs"]
 mod fitting_nominal_diameter;
+#[path = "../flex_duct_corpus.rs"]
+mod flex_duct_corpus;
 #[path = "../fuzz_regressions.rs"]
 mod fuzz_regressions;
 #[path = "../graceful_degradation.rs"]
@@ -89,6 +91,8 @@ mod mep_connections;
 mod mep_systems;
 #[path = "../native_current_records.rs"]
 mod native_current_records;
+#[path = "../native_ifc_parameters.rs"]
+mod native_ifc_parameters;
 #[path = "../native_partitions_walk.rs"]
 mod native_partitions_walk;
 #[path = "../native_phases.rs"]
@@ -133,6 +137,8 @@ mod rvt_inspect_cli;
 mod rvt_schedule_cli;
 #[path = "../samples.rs"]
 mod samples;
+#[path = "../saved_meshes_corpus.rs"]
+mod saved_meshes_corpus;
 #[path = "../schema_registry_catalogs.rs"]
 mod schema_registry_catalogs;
 #[path = "../segment_length.rs"]

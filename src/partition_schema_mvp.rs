@@ -5972,7 +5972,7 @@ fn select_instance_records(
     // 80th is exported as two stacked solids whose depths sum to the
     // recorded extent) (#212, RE-22).
     //
-    // Ties go to the **newest** frame — the greatest (stream, offset)
+    // Ties go to the **newest** frame — the greatest (partition number, offset)
     // — because a Revit 2024 project rewrites an edited element into a
     // higher-numbered `Partitions/NN` stream and leaves the earlier
     // copy in place. On `2024_Core_Interior.rvt` 171 of 360 walls and
@@ -6009,8 +6009,7 @@ fn select_instance_records(
                 let held = z_extent_key(existing);
                 candidate > held
                     || (candidate == held
-                        && (record.stream.as_str(), record.offset)
-                            > (existing.stream.as_str(), existing.offset))
+                        && partition_record_recency(&record) > partition_record_recency(existing))
             }
         };
         if better {
@@ -6181,6 +6180,20 @@ fn type_and_family_names_2023(
     out
 }
 
+/// Partition numbers are chronological integers: `/1000` follows `/999`,
+/// even though its stream name sorts before it as text.
+fn partition_record_recency(
+    record: &crate::partition_element_records::PartitionElementRecord,
+) -> (u32, usize) {
+    let partition = record
+        .stream
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0);
+    (partition, record.offset)
+}
+
 /// [`select_instance_records`] for Revit 2023 (RE-107): of an element's
 /// frames, the newest, in the highest-numbered partition and then the
 /// latest in it. A 2023 project's frames can disagree about their height,
@@ -6193,22 +6206,14 @@ fn select_newest_instance_records(
     records: Vec<crate::partition_element_records::PartitionElementRecord>,
 ) -> std::collections::BTreeMap<u32, crate::partition_element_records::PartitionElementRecord> {
     use crate::partition_element_records::PartitionElementRecord;
-    let partition = |record: &PartitionElementRecord| {
-        record
-            .stream
-            .rsplit('/')
-            .next()
-            .and_then(|n| n.parse::<u32>().ok())
-            .unwrap_or(0)
-    };
     let mut by_id: BTreeMap<u32, PartitionElementRecord> = BTreeMap::new();
     for record in records {
         if !record.is_exported_instance() || !record.has_volume() {
             continue;
         }
-        let newer = by_id.get(&record.element_id).is_none_or(|held| {
-            (partition(&record), record.offset) > (partition(held), held.offset)
-        });
+        let newer = by_id
+            .get(&record.element_id)
+            .is_none_or(|held| partition_record_recency(&record) > partition_record_recency(held));
         if newer {
             by_id.insert(record.element_id, record);
         }

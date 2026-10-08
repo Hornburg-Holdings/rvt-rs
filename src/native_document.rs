@@ -181,7 +181,7 @@ fn read_single_envelope(file: &mut RevitFile, name: &str) -> Result<(Vec<u8>, St
 pub(crate) struct Preamble {
     global_streams: BTreeMap<String, StreamEnvelope>,
     registry: schema_registry::Registry,
-    index: native_index::ProjectIndex,
+    index: native_index::CompactProjectIndex,
     increments: Vec<native_index::Increment>,
     es_catalog:
         std::result::Result<(crate::native_extensible_storage::Catalog, serde_json::Value), String>,
@@ -195,7 +195,7 @@ pub(crate) fn read_preamble(file: &mut RevitFile) -> Result<Preamble> {
     };
     let registry = schema_registry::parse(&read("Formats/Latest")?)?;
     let episodes = native_index::creation_episodes(&read("Global/History")?, &registry)?;
-    let index = native_index::parse(&read("Global/ElemTable")?, &registry, &episodes)?;
+    let index = native_index::parse_compact(&read("Global/ElemTable")?, &registry, &episodes)?;
     let increments =
         native_index::storage_increments(&read("Global/DocumentIncrementTable")?, &registry)?;
     let es_catalog = read("Global/Latest")
@@ -208,6 +208,27 @@ pub(crate) fn read_preamble(file: &mut RevitFile) -> Result<Preamble> {
         increments,
         es_catalog,
     })
+}
+
+/// Use the cached routing index's deletion evidence when the native preamble
+/// is supported. A classifier used to require only schema, history and index;
+/// preserve that narrower read path if another preamble stream is unsupported.
+pub(crate) fn qualified_graveyard_ids(
+    file: &mut RevitFile,
+    declared: &BTreeSet<u32>,
+) -> Result<BTreeSet<u64>> {
+    if let Ok(preamble) = file.native_preamble() {
+        return preamble.index.qualified_graveyard_ids(declared);
+    }
+    let registry = schema_registry::parse(&read_single(file, "Formats/Latest")?)?;
+    let episodes =
+        native_index::creation_episodes(&read_single(file, "Global/History")?, &registry)?;
+    native_index::parse_compact(
+        &read_single(file, "Global/ElemTable")?,
+        &registry,
+        &episodes,
+    )?
+    .qualified_graveyard_ids(declared)
 }
 /// Extract selected current indexed records. Unsupported individual object
 /// graphs produce explicit records and do not discard other decoded owners.
@@ -411,7 +432,7 @@ fn extract_records(
         revit_version: version,
         schema_sha256: registry.source_sha256.clone(),
         indexed_elements: index.identities.len(),
-        graveyard_records: index.graveyard_rows.len(),
+        graveyard_records: index.graveyard_records,
         selected_indexed_elements: selected.len(),
         serialized_values_not_evaluated: true,
         requested_ids_absent_from_index: options

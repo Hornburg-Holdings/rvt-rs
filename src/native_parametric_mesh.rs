@@ -317,30 +317,87 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
                 }
                 let s = ParametricSurface::read(g, surface_index)?;
                 let ParametricSurface::RuledSurf {
-                    profile1:
-                        Curve::Line {
-                            direction: a,
-                            range: ra,
-                            ..
-                        },
-                    profile2:
-                        Curve::Line {
-                            direction: b,
-                            range: rb,
-                            ..
-                        },
+                    profile1,
+                    profile2,
+                    envelope,
                     ..
                 } = s
                 else {
-                    anyhow::bail!("nonlinear ruled profiles need a curvature policy")
+                    anyhow::bail!("expected ruled component surface")
                 };
-                let da = std::array::from_fn(|k| a[k] * (ra[1] - ra[0]));
-                let db = std::array::from_fn(|k| b[k] * (rb[1] - rb[0]));
-                let mixed = length(std::array::from_fn(|k| da[k] - db[k]));
-                n = n
-                    .max((mixed / CHORD).sqrt().ceil())
-                    .max(length(da).ceil())
-                    .max(length(db).ceil());
+                if let (
+                    Curve::Line {
+                        direction: a,
+                        range: ra,
+                        ..
+                    },
+                    Curve::Line {
+                        direction: b,
+                        range: rb,
+                        ..
+                    },
+                ) = (&profile1, &profile2)
+                {
+                    // Preserve the established line-only grid exactly.
+                    let da = std::array::from_fn(|k| a[k] * (ra[1] - ra[0]));
+                    let db = std::array::from_fn(|k| b[k] * (rb[1] - rb[0]));
+                    let mixed = length(std::array::from_fn(|k| da[k] - db[k]));
+                    n = n
+                        .max((mixed / CHORD).sqrt().ceil())
+                        .max(length(da).ceil())
+                        .max(length(db).ceil());
+                } else {
+                    // With normalized profile parameter U, a ruled patch is
+                    // P(U,V)=(1-V)C1(U)+V*C2(U). P_VV is zero. Bounds on P_UU
+                    // and P_UV give a conservative positional error for either
+                    // triangle in a grid cell of width at most 1/n:
+                    // M_UU/(8*n*n) + M_UV/(4*n*n). The stricter sum below
+                    // retains the existing 0.001 saved-unit chord policy.
+                    let bounds = |curve: &Curve| {
+                        match curve {
+                            Curve::Line {
+                                direction, range, ..
+                            } => (length(*direction) * (range[1] - range[0]), 0., 0.),
+                            Curve::Arc {
+                                x,
+                                y,
+                                radius,
+                                range,
+                                ..
+                            } => {
+                                let span = range[1] - range[0];
+                                // Cauchy-Schwarz bounds every sine/cosine
+                                // combination even for the admitted floating
+                                // point deviation from an orthonormal basis.
+                                let radial_bound = radius * length(*x).hypot(length(*y));
+                                (
+                                    radial_bound * span,
+                                    radial_bound * span * span,
+                                    span / std::f64::consts::FRAC_PI_2,
+                                )
+                            }
+                        }
+                    };
+                    let (speed1, curvature1, angular1) = bounds(&profile1);
+                    let (speed2, curvature2, angular2) = bounds(&profile2);
+                    let curvature = [envelope[0][1], envelope[1][1]]
+                        .into_iter()
+                        .map(|v| (1. - v).abs() * curvature1 + v.abs() * curvature2)
+                        .fold(0., f64::max);
+                    let mixed = speed1 + speed2;
+                    ensure!(
+                        [speed1, speed2, curvature, mixed, angular1, angular2]
+                            .iter()
+                            .all(|value| value.is_finite()),
+                        "ruled curvature bound is nonfinite"
+                    );
+                    n = n
+                        .max(((curvature + mixed) / CHORD).sqrt().ceil())
+                        .max(speed1.ceil())
+                        .max(speed2.ceil())
+                        .max(angular1.ceil())
+                        .max(angular2.ceil());
+                }
             }
             (1. / n, 1. / n)
         }

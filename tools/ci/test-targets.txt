@@ -57,6 +57,7 @@ real      level_names
 real      mep_connections
 real      mep_systems
 real      native_current_records
+real      native_ifc_parameters
 real      native_partitions_walk
 real      native_phases
 real      partition_record_chain
@@ -77,6 +78,8 @@ real      serial_number
 real      space_common
 real      space_containment
 real      space_types
+real      saved_meshes_corpus
+real      flex_duct_corpus
 real      spatial_property_sets
 real      type_global_ids
 real      typed_no_geometry_types
@@ -92,6 +95,7 @@ cli       rvt_ifc_diagnostics_cli
 cli       rvt_info_cli
 cli       rvt_inspect_cli
 cli       rvt_schedule_cli
+
 
 contract  binary_inventory
 contract  field_type_coverage

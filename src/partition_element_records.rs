@@ -200,6 +200,9 @@ pub const OST_STAIRS_RAILING: i64 = -2_000_126;
 pub const OST_CORNICES: i64 = -2_000_181;
 /// Autodesk `BuiltInCategory.OST_DuctCurves` — ducts.
 pub const OST_DUCT_CURVES: i64 = -2_008_000;
+/// Autodesk `BuiltInCategory.OST_FlexDuctCurves` — physical flexible ducts.
+/// `OST_FlexDuctCurvesCenterLine` (-2_008_021) is a separate helper category.
+pub const OST_FLEX_DUCT_CURVES: i64 = -2_008_020;
 /// Autodesk `BuiltInCategory.OST_DuctFitting`.
 pub const OST_DUCT_FITTING: i64 = -2_008_010;
 /// Autodesk `BuiltInCategory.OST_PipeCurves` — pipes.
@@ -273,7 +276,7 @@ pub const OST_EDGE_SLAB: i64 = -2_001_392;
 /// Categories whose placed element records export directly as typed IFC
 /// products, with the class name each is decoded as (RE-33).
 ///
-/// On every file where a category occurs, the RE-21 instance rule (no
+/// For the reference-measured categories below, the RE-21 instance rule (no
 /// container reference, placed) selects only ElementIds that Revit's own
 /// export carries as `Tag`, with no false positive:
 ///
@@ -303,9 +306,15 @@ pub const OST_EDGE_SLAB: i64 = -2_001_392;
 /// RE1 Mechanical; 12 lighting fixtures on RE1 Electrical.
 ///
 /// RE-39 adds stairs with their runs, landings and stringers, and roofs.
+/// Flexible ducts use the same declared-id and placed-volume checks. Their
+/// category is the public `OST_FlexDuctCurves` value, observed on a real 2024
+/// mechanical project; unlike the reference-measured categories above, their
+/// complete set and shape have not been compared with a Revit IFC export.
+/// Their body is explicitly a record box unless saved graphics replace it.
+///
 /// RE-40 adds slab edges, once elements in non-primary design options are
 /// left out: all 59 exported on Snowdon Towers are Revit's.
-pub const PRODUCT_RECORD_CATEGORIES: [(i64, &str); 38] = [
+pub const PRODUCT_RECORD_CATEGORIES: [(i64, &str); 39] = [
     (OST_FURNITURE, "Furniture"),
     (OST_CASEWORK, "Casework"),
     (OST_PLUMBING_FIXTURES, "PlumbingFixture"),
@@ -316,6 +325,7 @@ pub const PRODUCT_RECORD_CATEGORIES: [(i64, &str); 38] = [
     (OST_STAIRS_RAILING, "Railing"),
     (OST_CORNICES, "WallSweep"),
     (OST_DUCT_CURVES, "Duct"),
+    (OST_FLEX_DUCT_CURVES, "FlexDuct"),
     (OST_DUCT_FITTING, "DuctFitting"),
     (OST_PIPE_CURVES, "Pipe"),
     (OST_PIPE_FITTING, "PipeFitting"),
@@ -1237,7 +1247,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// The categories the exporter recovers instances of, with the class name
 /// each is decoded as: the architectural core plus
 /// [`PRODUCT_RECORD_CATEGORIES`].
-pub const RECOVERED_CATEGORIES: [(i64, &str); 45] = [
+pub const RECOVERED_CATEGORIES: [(i64, &str); 46] = [
     (OST_WALLS, "Wall"),
     (OST_DOORS, "Door"),
     (OST_WINDOWS, "Window"),
@@ -1255,6 +1265,7 @@ pub const RECOVERED_CATEGORIES: [(i64, &str); 45] = [
     (OST_STAIRS_RAILING, "Railing"),
     (OST_CORNICES, "WallSweep"),
     (OST_DUCT_CURVES, "Duct"),
+    (OST_FLEX_DUCT_CURVES, "FlexDuct"),
     (OST_DUCT_FITTING, "DuctFitting"),
     (OST_PIPE_CURVES, "Pipe"),
     (OST_PIPE_FITTING, "PipeFitting"),
@@ -1333,14 +1344,30 @@ pub fn count_unattributed_frames_excluding(
     assigned: &BTreeMap<usize, u32>,
 ) -> BTreeMap<i64, usize> {
     let mut counts = BTreeMap::new();
+    visit_unattributed_frames(buf, categories, marker, assigned, |category, _, _| {
+        *counts.entry(category).or_insert(0) += 1;
+    });
+    counts
+}
+
+fn visit_unattributed_frames(
+    buf: &[u8],
+    categories: &[i64],
+    marker: &[u8; 8],
+    assigned: &BTreeMap<usize, u32>,
+    mut visit: impl FnMut(i64, usize, &PartitionRecordSpan),
+) {
     let chain = partition_record_chain(buf, marker);
     for hit in memchr::memmem::find_iter(buf, marker) {
         let Some(offset) = hit.checked_sub(BBOX_MARKER_OFFSET) else {
             continue;
         };
-        if assigned.contains_key(&offset) || enclosing_record(&chain, offset).is_none() {
+        if assigned.contains_key(&offset) {
             continue;
         }
+        let Some(span) = enclosing_record(&chain, offset) else {
+            continue;
+        };
         let Some(category) = read_u64(buf, offset + CATEGORY_OFFSET).map(|v| v as i64) else {
             continue;
         };
@@ -1353,10 +1380,9 @@ pub fn count_unattributed_frames_excluding(
         // A frame with no volume is a 2D symbol Revit's export leaves out
         // (#309), so it is not a missing element either.
         if is_instance_frame(buf, offset) && frame_has_volume(buf, offset) {
-            *counts.entry(category).or_insert(0) += 1;
+            visit(category, offset, span);
         }
     }
-    counts
 }
 
 /// [`count_unattributed_frames`] over every `Partitions/*` stream for the
@@ -1388,6 +1414,97 @@ pub fn scan_unattributed_frames(
         }
     }
     Ok(by_class)
+}
+
+/// Diagnostic split of raw unattributed frames. Graveyard frames are historical
+/// records, not current model elements; this never admits them to an export.
+#[derive(Debug, Default)]
+pub(crate) struct UnattributedFrameDiagnostics {
+    /// Frames whose current-model membership remains unresolved, by class.
+    pub unresolved: BTreeMap<String, usize>,
+    /// Frames belonging to uniquely identified graveyard records, by class.
+    /// Multiple historical frames of one owner are counted individually.
+    pub graveyard: BTreeMap<String, usize>,
+    /// Schema/index failures that left the raw unresolved counts unchanged.
+    pub warnings: Vec<String>,
+}
+
+/// Split [`scan_unattributed_frames`] only where the file's own schema proves
+/// the enclosing record belongs to the ElemTable graveyard and its ID is absent
+/// from both the declared-ID set and the native current index. Ambiguous IDs or
+/// incomplete frames stay unresolved. The schema index is read only when raw
+/// omission candidates exist; failure preserves all raw omission counts.
+pub(crate) fn classify_unattributed_frames(
+    rf: &mut RevitFile,
+    revit_version: u32,
+) -> UnattributedFrameDiagnostics {
+    let mut result = UnattributedFrameDiagnostics::default();
+    let Some(marker) = file_bbox_marker(rf, revit_version) else {
+        return result;
+    };
+    let categories: Vec<_> = RECOVERED_CATEGORIES.iter().map(|(id, _)| *id).collect();
+    let assigned_all = rf.second_prologue_ids();
+    let none = BTreeMap::new();
+    let mut candidates = BTreeMap::<(i64, Option<u64>), usize>::new();
+    for stream in rf.partition_stream_names() {
+        let Ok(inflated) = rf.inflated_partition(&stream) else {
+            continue;
+        };
+        let assigned = assigned_all.get(&stream).unwrap_or(&none);
+        visit_unattributed_frames(
+            inflated.bytes(),
+            &categories,
+            &marker,
+            assigned,
+            |category, offset, span| {
+                // A marker whose bbox crosses a record boundary is still a raw
+                // candidate, but cannot be suppressed by that record's owner.
+                let owner = offset
+                    .checked_add(BBOX_OFFSET + 48)
+                    .filter(|end| *end <= span.end)
+                    .map(|_| span.element_id);
+                *candidates.entry((category, owner)).or_default() += 1;
+                if let Some((_, class)) =
+                    RECOVERED_CATEGORIES.iter().find(|(id, _)| *id == category)
+                {
+                    *result.unresolved.entry((*class).into()).or_default() += 1;
+                }
+            },
+        );
+    }
+    if candidates.is_empty() {
+        return result;
+    }
+    let qualified_ids = (|| -> anyhow::Result<BTreeSet<u64>> {
+        let declared = crate::elem_table::declared_ids(&crate::elem_table::parse_records(rf)?);
+        crate::native_document::qualified_graveyard_ids(rf, &declared)
+    })();
+    let qualified_ids = match qualified_ids {
+        Ok(ids) => ids,
+        Err(error) => {
+            result.warnings.push(format!(
+                "Could not verify unattributed records against the schema-decoded graveyard; \
+                 all omission candidates remain unresolved: {error}"
+            ));
+            return result;
+        }
+    };
+    for ((category, owner), count) in candidates {
+        if !owner.is_some_and(|id| qualified_ids.contains(&id)) {
+            continue;
+        }
+        let Some((_, class)) = RECOVERED_CATEGORIES.iter().find(|(id, _)| *id == category) else {
+            continue;
+        };
+        let unresolved = result
+            .unresolved
+            .get_mut(*class)
+            .expect("counted candidate");
+        *unresolved -= count;
+        *result.graveyard.entry((*class).into()).or_default() += count;
+    }
+    result.unresolved.retain(|_, count| *count != 0);
+    result
 }
 
 /// Placed instances of the [`RECOVERED_CATEGORIES`] whose bounding box has

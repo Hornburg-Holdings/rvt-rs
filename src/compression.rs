@@ -225,10 +225,13 @@ impl InflatedStream {
         let mut concat = Vec::with_capacity(total);
         let mut chunk_ends = Vec::with_capacity(chunks.len());
         let mut members = Vec::with_capacity(chunks.len());
-        for (offset, consumed, chunk) in &chunks {
-            concat.extend_from_slice(chunk);
+        // Release each source member once it has been copied. Keeping all
+        // members alive until concatenation finishes duplicates the entire
+        // inflated stream at the peak of a large partition read.
+        for (offset, consumed, chunk) in chunks {
+            concat.extend_from_slice(&chunk);
             chunk_ends.push(concat.len());
-            members.push((*offset, *consumed));
+            members.push((offset, consumed));
         }
         Self {
             concat,

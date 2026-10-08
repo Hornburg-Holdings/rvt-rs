@@ -1,6 +1,6 @@
 # Project Status
 
-Last reviewed: 2026-09-28
+Last reviewed: 2026-10-06
 
 This page is the public source of truth for what rvt-rs can do today. It is
 intentionally blunt so users can decide quickly whether the tool fits their
@@ -83,6 +83,18 @@ its display, RE-78), hip and gable roofs, the boundaries of
 rooms whose stored solid does not close, opening profiles and phase
 filtering are not decoded, and rvt-rs does not edit
 Revit model data.
+
+**Native project parsing:** Element tables retain 32-bit record counts and
+accept validated secondary-ordered layouts. Increment tables use bounded
+resource accounting; equal-height instances use numeric partition order.
+Saved graphics report incomplete bodies, and schema-proven historical records
+remain distinct from unresolved current-model omissions.
+
+The IFC exporter preserves saved occurrence and type parameters with explicit
+ownership and dimensional measures. Reflected cylinder bases, orthogonal
+cylinder trims and arc-profile ruled patches retain their saved parameterization.
+Unsupported geometry remains disclosed. Saved parameters and readable display
+meshes do not establish evaluated takeoff quantities or full export parity.
 
 ## Finding history
 

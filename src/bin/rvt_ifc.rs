@@ -151,14 +151,26 @@ fn run(args: Args) -> anyhow::Result<()> {
         // the export goes ahead with the bodies it has, and says so.
         match rvt::ifc::saved_meshes::attach(&mut rf, &mut model) {
             Ok(report) => {
-                rvt::ifc::recount_exported(&mut diagnostics, &model);
+                if report.partial_replaced > 0 || report.unreplaced > 0 {
+                    diagnostics.warnings.push(format!(
+                        "Saved graphics: {} replaced bodies are partial; {} candidate bodies remain unchanged. See saved_meshes.issues for element IDs and reasons.",
+                        report.partial_replaced, report.unreplaced
+                    ));
+                }
                 eprintln!(
-                    "rvt-ifc: {} of {} bounding-box bodies drawn from their saved graphics ({} triangles)",
-                    report.replaced, report.candidates, report.triangles
+                    "rvt-ifc: {} of {} bounding-box bodies drawn from their saved graphics ({} triangles; {} partial bodies)",
+                    report.replaced, report.candidates, report.triangles, report.partial_replaced
                 );
+                diagnostics.saved_meshes = Some(report);
             }
-            Err(e) => eprintln!("rvt-ifc: saved graphics not read, bodies unchanged: {e}"),
+            Err(e) => {
+                diagnostics.warnings.push(format!(
+                    "Saved graphics could not be read; existing bodies are unchanged: {e}"
+                ));
+                eprintln!("rvt-ifc: saved graphics not read, bodies unchanged: {e}");
+            }
         }
+        rvt::ifc::recount_exported(&mut diagnostics, &model);
     }
 
     let out_path = args.output.clone().unwrap_or_else(|| {

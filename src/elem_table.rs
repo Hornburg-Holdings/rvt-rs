@@ -13,7 +13,9 @@
 //! That is STE1200's frame, measured by puzzbobb on 30 files from 2008 to
 //! 2027: read so, the stated number of records fits before a 19-byte
 //! (28 B) or 24-byte (40 B) tail on project files, the ids rise strictly,
-//! every set owner is an id of the table, and no owner chain loops. Family
+//! every set owner is an id of the table, and no owner chain loops. The
+//! secondary ids order the 40-byte records when primary ids are remapped;
+//! those primary ids can repeat or move backwards. Family
 //! files use the same records and leave an unset owner at `0` where project
 //! files write all `0xFF`; their records are followed by a longer trailer.
 //!
@@ -42,10 +44,9 @@ pub struct ElemTableHeader {
     /// 2016, 1411 on 2024, 1481 on 2026). For the declared ElementIds use
     /// [`declared_element_ids`].
     pub element_count: u16,
-    /// The number of records, the low 16 bits of the `u32` count at `0x02`
-    /// (every file measured has fewer than 65,536 records; [`parse_records`]
-    /// reads the whole `u32`).
-    pub record_count: u16,
+    /// The full `u32` number of records at `0x02`. Large projects can
+    /// contain more than 65,535 records.
+    pub record_count: u32,
     /// The `0x0011` found at `0x1E` / `0x22` on family files, 0 elsewhere.
     /// It is the owner field of the table's first record (ElementId 17 on
     /// family files), not a header field (#152).
@@ -131,7 +132,7 @@ fn parse_header_bytes(d: &[u8]) -> Result<ElemTableHeader> {
         ));
     }
     let element_count = u16::from_le_bytes([d[0], d[1]]);
-    let record_count = u16::from_le_bytes([d[2], d[3]]);
+    let record_count = u32::from_le_bytes([d[2], d[3], d[4], d[5]]);
     let header_flag = [0x1eusize, 0x22]
         .iter()
         .find_map(|&off| {
@@ -171,8 +172,11 @@ fn u32_at(d: &[u8], at: usize) -> Option<u32> {
 }
 
 /// Detect the record layout: the record size (28 or 40 bytes) at which the
-/// stated number of records fits from `0x06` with ids rising over the whole
-/// table. When both fit equally, the one that leaves the shorter tail wins
+/// stated number of records fits from `0x06` with primary ids rising over
+/// the whole table. The 40-byte layout also accepts strictly rising
+/// secondary ids when both id fields fit `u32` and every set owner is a
+/// secondary id. Remapped primary ids need not rise or be unique.
+/// When both fit equally, the one that leaves the shorter tail wins
 /// (a 40-byte table also fits at 28). Falls back to the 12-byte implicit
 /// layout from `0x30` when neither fits.
 pub fn detect_layout(d: &[u8]) -> ElemTableLayout {
@@ -204,7 +208,9 @@ pub fn detect_layout(d: &[u8]) -> ElemTableLayout {
     let best = [40usize, 28]
         .into_iter()
         .filter_map(|stride| rising(stride).map(|(rises, tail)| (stride, rises, tail)))
-        .filter(|&(_, rises, _)| rises + 1 == count)
+        .filter(|&(stride, rises, _)| {
+            rises + 1 == count || (stride == 40 && secondary_ordered_table(d, count))
+        })
         .min_by_key(|&(_, _, tail)| tail);
     let Some((stride, _, _)) = best else {
         return fallback;
@@ -218,6 +224,47 @@ pub fn detect_layout(d: &[u8]) -> ElemTableLayout {
             marker_len: owner_width,
         },
     }
+}
+
+/// Independently validate the secondary-ordered 40-byte form. This adds
+/// support for remapped primary ids without guessing a stride or trusting
+/// arbitrary words as declared ElementIds.
+fn secondary_ordered_table(d: &[u8], count: usize) -> bool {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut previous = None;
+    for k in 0..count {
+        let at = RECORDS_ORIGIN + k * RECORD_LEN_40;
+        // `detect_layout` has already checked the full record array fits.
+        // The rest of the reader currently supports only u32 ElementIds.
+        if u32_at(d, at + 4) != Some(0) || u32_at(d, at + 24) != Some(0) {
+            return false;
+        }
+        let Some(id) = u32_at(d, at + 20) else {
+            return false;
+        };
+        if previous.is_some_and(|p| id <= p) {
+            return false;
+        }
+        previous = Some(id);
+        ids.insert(id);
+    }
+    for k in 0..count {
+        let at = RECORDS_ORIGIN + k * RECORD_LEN_40;
+        let Some(field) = d.get(at + 28..at + 36) else {
+            return false;
+        };
+        let Ok(bytes) = field.try_into() else {
+            return false;
+        };
+        let owner = u64::from_le_bytes(bytes);
+        if owner == 0 || owner == u64::MAX {
+            continue;
+        }
+        if !u32::try_from(owner).is_ok_and(|id| ids.contains(&id)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Parse only the header portion of Global/ElemTable. Sufficient for counts
@@ -308,16 +355,14 @@ fn inflate(rf: &mut RevitFile) -> Result<Vec<u8>> {
 }
 
 /// Parse all records from Global/ElemTable: the `u32` count at `0x02`
-/// records from `0x06`, at the record size [`detect_layout`] finds. On the
-/// implicit fallback layout the count is the header's `record_count`.
+/// records from `0x06`, at the record size [`detect_layout`] finds. The
+/// full count is preserved on the implicit fallback layout too.
 pub fn parse_records(rf: &mut RevitFile) -> Result<Vec<ElemRecord>> {
     let d = inflate(rf)?;
     let header = parse_header_bytes(&d)?;
     let layout = detect_layout(&d);
-    let limit = match layout.framing {
-        RecordFraming::Explicit { .. } => stated_count(&d).unwrap_or(0),
-        RecordFraming::Implicit => usize::from(header.record_count),
-    };
+    let limit = usize::try_from(header.record_count)
+        .map_err(|_| Error::BasicFileInfo("ElemTable record count does not fit usize".into()))?;
     Ok(parse_records_from_bytes(&d, layout, limit))
 }
 

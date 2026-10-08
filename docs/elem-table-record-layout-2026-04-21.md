@@ -309,7 +309,7 @@ a curtain panel, mullion or grid, the sketch of a sketch line, and the
 model group of a grouped element. The library reads it as
 `ElemRecord::owner_id`.
 
-`record_count` is still read as a `u16`. No corpus file has more than
+At the time of this measurement, `record_count` was still read as a `u16`. No corpus file had more than
 65,535 records, so whether bytes 4–5 hold the high half (that is, whether
 the field is really a `u32`) is unmeasured. A file past that bound would
 fail the flush check and keep the marker-spacing layout rather than parse
@@ -341,3 +341,17 @@ prompted a re-measurement on all 11 `phi-ag/rvt` family releases:
   count of elements. It is the same value on every file of a release,
   project or family: 1370 on 2023, 1411 on 2024, 1451 on 2025 and 1481 on
   2026.
+
+## Secondary-ordered large project tables
+
+`Global/ElemTable` uses a full `u32` record count. The detector accepts
+secondary-ordered 40-byte records beginning at `0x06`, including tables whose
+primary IDs repeat or move backwards. Secondary IDs (`+20`) must increase
+strictly; both ID columns must fit `u32`, and every set owner must belong to
+the secondary-ID column. Existing primary-ordered layouts remain supported.
+Record bounds are validated without requiring an exact stream fit; undecoded
+trailer bytes do not become records.
+
+`tests/elem_table_frame.rs` checks this layout against local project files
+supplied through `RVT_ELEM_TABLE_REMAP_DIR`. The public header and CLI JSON
+retain the full count. Index recovery does not establish geometry completeness.

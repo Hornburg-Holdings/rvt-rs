@@ -239,6 +239,25 @@ pub fn decode_object_fields(
     start: usize,
     class_tag: u16,
 ) -> Result<ObjectFields> {
+    decode_object_fields_with_value_budget(
+        body,
+        registry,
+        start,
+        class_tag,
+        GraphLimits::default().max_values,
+    )
+    .map(|(fields, _)| fields)
+}
+
+/// Decode an independently located row within a caller's aggregate work budget.
+/// The standard per-object ceiling and all other decoder budgets still apply.
+pub(crate) fn decode_object_fields_with_value_budget(
+    body: &[u8],
+    registry: &Registry,
+    start: usize,
+    class_tag: u16,
+    remaining_values: usize,
+) -> Result<(ObjectFields, usize)> {
     ensure!(
         start <= body.len(),
         "native object offset outside bounded body"
@@ -256,17 +275,23 @@ pub fn decode_object_fields(
         items: 0,
         pending: Vec::new(),
         spans: Vec::new(),
-        limits: GraphLimits::default(),
+        limits: GraphLimits {
+            max_values: GraphLimits::default().max_values.min(remaining_values),
+            ..GraphLimits::default()
+        },
     };
     let fields = cursor.class(class_tag, 0)?;
-    Ok(ObjectFields {
-        class_tag,
-        class_name,
-        start,
-        end: cursor.pos,
-        fields,
-        field_spans: cursor.spans,
-    })
+    Ok((
+        ObjectFields {
+            class_tag,
+            class_name,
+            start,
+            end: cursor.pos,
+            fields,
+            field_spans: cursor.spans,
+        },
+        cursor.items,
+    ))
 }
 struct PendingPointer {
     token: u32,

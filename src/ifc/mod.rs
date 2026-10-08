@@ -42,7 +42,7 @@
 //!    | Family (RFA) | `IfcTypeObject` + `IfcRepresentationMap` (pending) |
 //!    | Uniformat / OmniClass codes | `IfcClassificationReference` (done) |
 //!    | Material | `IfcMaterial` / `IfcMaterialLayerSet` (pending) |
-//!    | Parameters | `IfcPropertySet` + `IfcPropertySingleValue` (pending) |
+//!    | Saved parameters | `RvtParameters` on occurrences and type objects (partial) |
 //!    | Host geometry | `IfcShapeRepresentation` (pending Phase 5) |
 //!
 //! 4. STEP serializer writes the `IfcModel` as `.ifc` text (done at
@@ -333,6 +333,10 @@ pub struct ExportDiagnostics {
     /// `None` when the stream is absent from the container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formats_latest_integrity: Option<crate::compression::FormatsLatestIntegrity>,
+    /// Outcome of requested saved-graphics replacement. Failures are recorded
+    /// in `warnings`; partial and unavailable owners remain explicit here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_meshes: Option<saved_meshes::SavedMeshReport>,
 }
 
 /// A10 export source-coverage block (measured when denominators exist).
@@ -1154,6 +1158,10 @@ fn export_rvt_doc(
         export_content::strip_building_element_geometry(&mut entities);
     }
 
+    // Saved owner parameters are independent of geometry. Current native
+    // record routing establishes ownership before any values reach IFC.
+    attach_native_parameter_sets(rf, &mut entities, &element_type_ids);
+
     let recovered_units = recover_project_units(rf);
     let global_ids = revit_model_global_ids(
         rf,
@@ -1198,6 +1206,441 @@ fn export_rvt_doc(
         material_constituent_sets,
         opening_cuts,
     })
+}
+
+/// Named saved Revit parameter values. These are serialized values, not
+/// evaluated API quantities; they do not create `Qto_*` or claim that a saved
+/// computed value was authored. Instance/type ownership remains distinct.
+const NATIVE_PARAMETER_SET: &str = "RvtParameters";
+
+fn attach_native_parameter_sets(
+    rf: &mut crate::RevitFile,
+    entities: &mut Vec<entities::IfcEntity>,
+    element_type_ids: &std::collections::BTreeMap<u32, u32>,
+) {
+    use crate::native_parameters::Parameter;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut instances = BTreeMap::<u32, Vec<usize>>::new();
+    for (index, entity) in entities.iter().enumerate() {
+        if let entities::IfcEntity::BuildingElement {
+            type_guid: Some(tag),
+            ..
+        } = entity
+        {
+            if let Ok(id) = tag.parse::<u32>() {
+                instances.entry(id).or_default().push(index);
+            }
+        }
+    }
+    if instances.is_empty() {
+        return;
+    }
+    let types: BTreeSet<u32> = instances
+        .keys()
+        .filter_map(|id| element_type_ids.get(id).copied())
+        .collect();
+    let options = crate::native_document::Options {
+        selected_ids: instances
+            .keys()
+            .chain(&types)
+            .map(|id| u64::from(*id))
+            .collect(),
+        ..Default::default()
+    };
+    let mut saved = BTreeMap::<u32, BTreeMap<i64, Option<Parameter>>>::new();
+    let mut type_names = BTreeMap::<u32, String>::new();
+    let summary = crate::native_document::extract(rf, &options, |record| {
+        let Ok(id) = u32::try_from(record.identity.element_id) else {
+            return Ok(());
+        };
+        if types.contains(&id) {
+            if let Some(name) = record
+                .graph
+                .as_ref()
+                .and_then(|graph| graph.objects.first())
+                .and_then(|root| root.fields.get("m_name"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                type_names.insert(id, name.to_owned());
+            }
+        }
+        let family_owner = record.graph.as_ref().and_then(root_family_parameter_owner);
+        let Some(metadata) = record.saved_metadata else {
+            return Ok(());
+        };
+        let values = saved.entry(id).or_default();
+        for parameter in metadata
+            .parameter_sets
+            .iter()
+            .flat_map(|set| &set.parameters)
+        {
+            merge_saved_parameter(values, parameter.clone());
+        }
+        for parameter in metadata.resolved_family_parameters {
+            if parameter.has_value
+                && family_owner
+                    .is_none_or(|(_, is_instance)| is_instance || !parameter.stored_instance_flag)
+            {
+                merge_saved_parameter(
+                    values,
+                    Parameter {
+                        serialized_parameter_id: parameter.parameter_id,
+                        storage_type: parameter.storage_type,
+                        raw_value: parameter.raw_value,
+                    },
+                );
+            }
+        }
+        // The four text built-ins have established String storage (the native
+        // typed sets and RE-77), so their explicit string slot is qualified.
+        // Never select another built-in's nonzero slot or inspect unrelated
+        // FamilyParams nodes deeper in the graph. A symbol's instance defaults
+        // are not type properties inherited by its occurrences.
+        if let Some((owner, is_instance)) = family_owner {
+            for slot in metadata.family_parameter_slots {
+                if slot.source_object == owner
+                    && (is_instance || !slot.stored_instance_flag)
+                    && matches!(
+                        slot.parameter_id,
+                        -1_001_203 | -1_001_405 | -1_010_103 | -1_001_206
+                    )
+                    && slot.string_slot.is_string()
+                {
+                    merge_saved_parameter(
+                        values,
+                        Parameter {
+                            serialized_parameter_id: slot.parameter_id,
+                            storage_type: "String".into(),
+                            raw_value: slot.string_slot,
+                        },
+                    );
+                }
+            }
+        }
+        for parameter in metadata.raw_field_parameters {
+            if parameter.projection_rule == "direct_saved_field"
+                && parameter
+                    .source_element_id
+                    .is_none_or(|owner| owner == i64::from(id))
+            {
+                merge_saved_parameter(
+                    values,
+                    Parameter {
+                        serialized_parameter_id: parameter.parameter_id,
+                        storage_type: parameter.storage_type,
+                        raw_value: parameter.raw_value,
+                    },
+                );
+            }
+        }
+        Ok(())
+    });
+
+    // RE-77's text values have already been recovered on the occurrences.
+    // Preserve their established type ownership even when an unsupported
+    // native graph cannot recover further parameters. Conflicts stay absent.
+    let mut legacy = BTreeMap::<u32, BTreeMap<i64, Option<Parameter>>>::new();
+    for (id, indices) in &instances {
+        let Some(type_id) = element_type_ids.get(id) else {
+            continue;
+        };
+        for index in indices {
+            let entities::IfcEntity::BuildingElement {
+                property_set: Some(set),
+                ..
+            } = &entities[*index]
+            else {
+                continue;
+            };
+            for (parameter_id, name) in crate::partition_type_parameters::TYPE_TEXT_PARAMETERS {
+                if let Some(value) =
+                    set.properties
+                        .iter()
+                        .find_map(|property| match &property.value {
+                            entities::PropertyValue::Text(value) if property.name == *name => {
+                                Some(value)
+                            }
+                            _ => None,
+                        })
+                {
+                    merge_saved_parameter(
+                        legacy.entry(*type_id).or_default(),
+                        Parameter {
+                            serialized_parameter_id: *parameter_id,
+                            storage_type: "String".into(),
+                            raw_value: value.clone().into(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let definitions = match summary {
+        Ok(summary) => summary.parameter_definitions,
+        // Framing/routing failures never export a partially collected owner
+        // selection. They do not erase the independently recovered RE-77 sets.
+        Err(_) => {
+            saved.clear();
+            type_names.clear();
+            BTreeMap::new()
+        }
+    };
+    for (type_id, values) in legacy {
+        let native = saved.entry(type_id).or_default();
+        for (parameter_id, value) in values {
+            match value {
+                Some(parameter) => merge_saved_parameter(native, parameter),
+                None => {
+                    native.insert(parameter_id, None);
+                }
+            }
+        }
+    }
+    // RE-77 also copied these type values onto each occurrence's identity set.
+    // A disagreement must not survive there after its type value is refused.
+    // Actual occurrence parameters live in the separate native owner set.
+    for (id, indices) in &instances {
+        let Some(values) = element_type_ids
+            .get(id)
+            .and_then(|type_id| saved.get(type_id))
+        else {
+            continue;
+        };
+        for index in indices {
+            if let entities::IfcEntity::BuildingElement {
+                property_set: Some(set),
+                ..
+            } = &mut entities[*index]
+            {
+                set.properties.retain(|property| {
+                    !crate::partition_type_parameters::TYPE_TEXT_PARAMETERS
+                        .iter()
+                        .any(|(parameter_id, name)| {
+                            property.name == *name && matches!(values.get(parameter_id), Some(None))
+                        })
+                });
+            }
+        }
+    }
+    for (id, values) in saved {
+        if types.contains(&id) {
+            if let Some(name) = values
+                .get(&-1_002_001)
+                .and_then(Option::as_ref)
+                .filter(|parameter| parameter.storage_type == "String")
+                .and_then(|parameter| parameter.raw_value.as_str())
+                .filter(|name| !name.is_empty())
+            {
+                type_names.insert(id, name.to_owned());
+            }
+        }
+        let mut properties: Vec<_> = values
+            .into_values()
+            .flatten()
+            .filter_map(|parameter| {
+                native_parameter_property(&parameter, &definitions)
+                    .map(|property| (parameter.serialized_parameter_id, property))
+            })
+            .collect();
+        let mut names = BTreeMap::<String, usize>::new();
+        for (_, property) in &properties {
+            *names.entry(property.name.clone()).or_default() += 1;
+        }
+        for (parameter_id, property) in &mut properties {
+            if names[&property.name] > 1 {
+                property.name = format!("{} [{parameter_id}]", property.name);
+            }
+        }
+        let properties: Vec<_> = properties
+            .into_iter()
+            .map(|(_, property)| property)
+            .collect();
+        if properties.is_empty() {
+            continue;
+        }
+        let set = entities::PropertySet {
+            name: NATIVE_PARAMETER_SET.into(),
+            properties,
+        };
+        if let Some(indices) = instances.get(&id) {
+            for index in indices {
+                entities.push(entities::IfcEntity::ElementPropertySet {
+                    element: *index,
+                    set: set.clone(),
+                });
+            }
+        }
+        if types.contains(&id) {
+            entities.push(entities::IfcEntity::TypePropertySet { type_id: id, set });
+        }
+    }
+    // A saved type name may fill a missing name. It never replaces the name
+    // already established by the record/name joins, or derives one from an ID.
+    for (id, indices) in instances {
+        let Some(name) = element_type_ids.get(&id).and_then(|id| type_names.get(id)) else {
+            continue;
+        };
+        for index in indices {
+            if let entities::IfcEntity::BuildingElement { property_set, .. } = &mut entities[index]
+            {
+                let set = property_set.get_or_insert_with(|| entities::PropertySet {
+                    name: "RvtElementIdentity".into(),
+                    properties: Vec::new(),
+                });
+                if !set
+                    .properties
+                    .iter()
+                    .any(|property| property.name == export_content::TYPE_NAME_PROPERTY)
+                {
+                    set.properties.push(entities::Property {
+                        name: export_content::TYPE_NAME_PROPERTY.into(),
+                        value: entities::PropertyValue::Text(name.clone()),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn root_family_parameter_owner(
+    graph: &crate::native_parameters::ObjectGraph,
+) -> Option<(usize, bool)> {
+    let root = graph.objects.first()?;
+    let (field, is_instance) = match root.class_name.as_str() {
+        "FamilyInstance" => ("m_pInstParams", true),
+        "FamilySymbol" => ("m_pParams", false),
+        _ => return None,
+    };
+    let pointer = root.fields.get(field)?;
+    if pointer["pointer_token"].as_u64()? == 0 {
+        return None;
+    }
+    let offset = usize::try_from(pointer["offset"].as_u64()?).ok()?;
+    let mut edges = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.source_object_index == 0 && edge.pointer_offset == offset);
+    let edge = edges.next()?;
+    if edges.next().is_some()
+        || graph.objects.get(edge.target_object_index)?.class_name != "FamilyParams"
+    {
+        return None;
+    }
+    Some((edge.target_object_index, is_instance))
+}
+
+fn merge_saved_parameter(
+    values: &mut std::collections::BTreeMap<i64, Option<crate::native_parameters::Parameter>>,
+    parameter: crate::native_parameters::Parameter,
+) {
+    use std::collections::btree_map::Entry;
+    match values.entry(parameter.serialized_parameter_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(Some(parameter));
+        }
+        Entry::Occupied(mut entry) => {
+            if entry.get().as_ref().is_some_and(|existing| {
+                existing.storage_type != parameter.storage_type
+                    || existing.raw_value != parameter.raw_value
+            }) {
+                entry.insert(None);
+            }
+        }
+    }
+}
+
+fn native_parameter_property(
+    parameter: &crate::native_parameters::Parameter,
+    definitions: &std::collections::BTreeMap<i64, crate::native_parameter_definitions::Definition>,
+) -> Option<entities::Property> {
+    use entities::PropertyValue;
+    let id = parameter.serialized_parameter_id;
+    let definition = definitions.get(&id);
+    if definition
+        .and_then(|definition| definition.storage_type.as_deref())
+        .is_some_and(|storage| storage != parameter.storage_type)
+    {
+        return None;
+    }
+    // Public BuiltInParameter IDs/captions, narrowly mapped only when their
+    // actual serialized storage type agrees. No general built-in catalog is
+    // enabled. Autodesk API reference: fb011c91-be7e-f737-28c7-3f1e1917a0e0.
+    let builtin = match (id, parameter.storage_type.as_str()) {
+        (-1_001_203, "String") => Some(("Mark", "string")),
+        (-1_001_405, "String") => Some(("Type Mark", "string")),
+        (-1_010_103, "String") => Some(("Description", "string")),
+        (-1_001_206, "String") => Some(("Fire Rating", "string")),
+        (-1_002_001, "String") => Some(("Type Name", "string")),
+        (-1_004_005 | -1_155_247, "Double") => Some(("Length", "length")),
+        (-1_001_953, "Double") => Some(("Perimeter", "length")),
+        (-1_012_805, "Double") => Some(("Area", "area")),
+        (-1_012_806, "Double") => Some(("Volume", "volume")),
+        // Native pipe fields are already mapped to these IDs by
+        // native_metadata::project. Their magnitudes, including signed
+        // offsets, use Revit's internal length base rather than display units.
+        (-1_140_225, "Double") => Some(("Diameter", "length")),
+        (-1_140_212, "Double") => Some(("Inside Diameter", "length")),
+        (-1_140_238, "Double") => Some(("Outside Diameter", "length")),
+        (-1_114_002, "Double") => Some(("Start Middle Elevation", "length")),
+        (-1_114_003, "Double") => Some(("End Middle Elevation", "length")),
+        _ => None,
+    };
+    let mut name = definition
+        .map(|definition| definition.caption.clone())
+        .filter(|name| !name.is_empty())
+        .or_else(|| builtin.map(|(name, _)| name.to_owned()))
+        .unwrap_or_else(|| format!("RevitParameter:{id}"));
+    if definition.is_some()
+        && definitions
+            .values()
+            .filter(|other| other.caption == name)
+            .count()
+            > 1
+    {
+        name = format!("{name} [{id}]");
+    }
+    let saved_spec = definition
+        .and_then(|definition| definition.spec_type_id.as_deref())
+        .and_then(|spec| spec.strip_prefix("autodesk.spec.aec:"))
+        .map(|spec| spec.split('-').next().unwrap_or(spec));
+    let spec = saved_spec.or_else(|| builtin.map(|(_, spec)| spec));
+    let value = match parameter.storage_type.as_str() {
+        "String" => PropertyValue::Text(parameter.raw_value.as_str()?.to_owned()),
+        "Integer" => {
+            let integer = parameter.raw_value.as_i64()?;
+            if definition
+                .and_then(|definition| definition.spec_type_id.as_deref())
+                .is_some_and(|spec| spec.starts_with("autodesk.spec:spec.bool-"))
+                && matches!(integer, 0 | 1)
+            {
+                PropertyValue::Boolean(integer == 1)
+            } else {
+                PropertyValue::Integer(integer)
+            }
+        }
+        "ElementId" => PropertyValue::Identifier(parameter.raw_value.as_i64()?.to_string()),
+        "Double" => {
+            let value = parameter
+                .raw_value
+                .as_f64()
+                .filter(|value| value.is_finite())?;
+            // Revit's native length base is feet, angle radians, time seconds
+            // (Autodesk Units GUID-099B3FD9-1C5B-459C-AC1E-EF958551DFB6).
+            // Project display units never change these serialized values.
+            match spec {
+                Some("length") => PropertyValue::LengthFeet(value),
+                Some("area") => PropertyValue::AreaSquareFeet(value),
+                Some("volume") => PropertyValue::VolumeCubicFeet(value),
+                Some("angle") => PropertyValue::AngleRadians(value),
+                Some("time") => PropertyValue::TimeSeconds(value),
+                _ => PropertyValue::Real(value),
+            }
+        }
+        _ => return None,
+    };
+    Some(entities::Property { name, value })
 }
 
 /// #227: each door or window whose body is a plain rectangular extrusion
@@ -3073,22 +3516,29 @@ pub fn build_export_diagnostics_with_limits(
     }
     let geometry_gaps = geometry_gap_skipped_items(model);
     skipped.extend(geometry_gaps.iter().cloned());
-    // RE-30: element frames of a recovered category that carry no
-    // attributable ElementId are rejected by the fail-closed decode, so a
-    // file made mostly of them exports a fraction of its model while
-    // looking complete. Count them so the sidecar says so.
+    // RE-30: unattributed recovered-category frames remain a coverage gap,
+    // except where the schema-decoded index proves their enclosing record
+    // belongs only to the graveyard. Historical frames are still reported,
+    // but do not make the current model incomplete.
     let unattributed_frames = bfi
         .as_ref()
-        .and_then(|b| {
-            crate::partition_element_records::scan_unattributed_frames(rf, b.version).ok()
-        })
+        .map(|b| crate::partition_element_records::classify_unattributed_frames(rf, b.version))
         .unwrap_or_default();
-    let unattributed_total: usize = unattributed_frames.values().sum();
+    let unattributed_total: usize = unattributed_frames.unresolved.values().sum();
     if unattributed_total > 0 {
         skipped.push(SkippedExportItem {
             reason: "element_record_without_element_id".into(),
             count: unattributed_total,
-            classes: unattributed_frames,
+            classes: unattributed_frames.unresolved,
+            sample_names: Vec::new(),
+        });
+    }
+    let graveyard_total: usize = unattributed_frames.graveyard.values().sum();
+    if graveyard_total > 0 {
+        skipped.push(SkippedExportItem {
+            reason: "element_record_in_graveyard".into(),
+            count: graveyard_total,
+            classes: unattributed_frames.graveyard,
             sample_names: Vec::new(),
         });
     }
@@ -3148,6 +3598,7 @@ pub fn build_export_diagnostics_with_limits(
 
     let recovered_units = recover_project_units(rf);
     let mut warnings = diagnostic_candidates.warnings;
+    warnings.extend(unattributed_frames.warnings);
     if !empty_panels.types_with_material.is_empty() {
         warnings.push(format!(
             "{} empty curtain panel type(s) carry a material, which an empty panel should not: {:?}",
@@ -3394,6 +3845,7 @@ pub fn build_export_diagnostics_with_limits(
         warnings,
         confidence,
         formats_latest_integrity,
+        saved_meshes: None,
     }
 }
 
@@ -3401,6 +3853,14 @@ pub fn build_export_diagnostics_with_limits(
 /// [`saved_meshes::attach`] does.
 pub fn recount_exported(diagnostics: &mut ExportDiagnostics, model: &IfcModel) {
     diagnostics.exported = exported_model_diagnostics(model);
+    diagnostics.confidence = export_confidence_summary(
+        diagnostics.mode,
+        &diagnostics.exported,
+        diagnostics.confidence.has_project_metadata,
+        usize::from(diagnostics.confidence.has_diagnostic_proxies),
+        diagnostics.warnings.len(),
+        diagnostics.confidence.unexported_element_records,
+    );
 }
 
 fn exported_model_diagnostics(model: &IfcModel) -> ExportedModelDiagnostics {

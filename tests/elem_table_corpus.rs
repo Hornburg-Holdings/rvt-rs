@@ -215,7 +215,7 @@ fn project_2024_file_parses_all_declared_records() {
     // shift that lost the last record, and #152 the 24-byte frame offset
     // that missed the first.
     assert_eq!(
-        records.len() as u16,
+        records.len() as u32,
         header.record_count,
         "parse_records should return exactly header.record_count on 2024 project files"
     );

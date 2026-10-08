@@ -8,6 +8,36 @@ All notable changes will be documented here. This project follows
 
 ### Added
 
+- **Saved native instance and type parameters** reach IFC as `RvtParameters`.
+  Type sets use `IfcTypeObject.HasPropertySets`, dimensional values follow
+  saved specifications, and conflicting values remain absent. These are saved
+  values, not evaluated quantities or `Qto_*`.
+- **Orthogonal cylinder trims and arc-profile ruled patches** use the saved
+  boundaries and existing chord-error policy. Other curved trims remain
+  unsupported. Geometry-only attachment releases root graphs after decoding
+  and retains only their shared graphics dependencies.
+- **Compact internal element-index retention** keeps current identities and
+  graveyard counts for routing and deletion diagnostics. The public index reader
+  preserves full saved rows; schema and framing validation are unchanged.
+
+- **Saved cylinders with reflected orthonormal bases** retain their saved
+  parameterization with determinant-aware normals; trim checks remain required.
+- **Physical flexible ducts** are admitted through the existing identity and
+  placement checks and exported as `IFCDUCTSEGMENT` / `FLEXIBLESEGMENT`, without
+  rigid-duct length/profile assumptions (geometry parity unmeasured).
+
+- **Large-project saved-graphics diagnostics.** `--saved-meshes` records partial
+  and unchanged bodies, element IDs and reasons in the diagnostics sidecar.
+  IFC bodies identify partial saved graphics, and failures remain visible to
+  strict quality checks.
+- **Bounded large increment-table reading and numeric partition ordering.**
+  Table rows retain per-object limits while sharing a byte-scaled work budget;
+  equal-height records compare numeric partition numbers. Geometry attachment
+  avoids unused metadata/material passes and full-scene mesh retention.
+- **Historical omission diagnostics.** Unattributed frames proven to belong
+  exclusively to the schema-decoded graveyard are reported separately from
+  missing current elements. Uncertain identities remain unresolved.
+
 - **Every join of an MEP model is read from its family instances' connectors
   (B86).** A family instance's native `Connector` objects list the elements
   joined to each connector (RE-171), so the export writes those joins

@@ -1,5 +1,6 @@
 mod common;
 
+use common::project_fixtures::{self, Project};
 use common::{sample_for_year, samples_dir};
 use serde_json::Value;
 use std::process::Command;
@@ -17,6 +18,90 @@ fn temp_diagnostics_dir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp diagnostics dir");
     dir
+}
+
+#[test]
+fn saved_graphics_cli_keeps_partial_and_failure_diagnostics() {
+    for fixture in project_fixtures::projects() {
+        let dir = temp_diagnostics_dir("rvt-rs-saved-graphics");
+        let ifc = dir.join("strict.ifc");
+        let sidecar = dir.join("strict.json");
+        let output = Command::new(env!("CARGO_BIN_EXE_rvt-ifc"))
+            .arg(&fixture.path)
+            .args(["--mode", "strict", "--saved-meshes", "-o"])
+            .arg(&ifc)
+            .arg("--diagnostics")
+            .arg(&sidecar)
+            .output()
+            .expect("run strict saved-graphics export");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("IFC export mode `strict`"));
+        assert!(!ifc.exists());
+        let diagnostics: rvt::ifc::ExportDiagnostics = serde_json::from_slice(
+            &std::fs::read(&sidecar).expect("read saved-graphics diagnostics"),
+        )
+        .expect("decode saved-graphics diagnostics");
+        let report = diagnostics
+            .saved_meshes
+            .as_ref()
+            .expect("saved-graphics report");
+        assert!(report.replaced > 0);
+        assert!(report.partial_replaced > 0);
+        assert!(!report.issues.is_empty());
+        assert!(
+            diagnostics
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Saved graphics:"))
+        );
+        assert_eq!(
+            diagnostics.confidence.warning_count,
+            diagnostics.warnings.len()
+        );
+
+        if fixture.project == Project::Structural {
+            let mut compound = cfb::CompoundFile::open(std::io::Cursor::new(
+                std::fs::read(&fixture.path).expect("read real file for CLI refusal check"),
+            ))
+            .expect("open real CFB container");
+            compound
+                .remove_stream("Global/DocumentIncrementTable")
+                .expect("remove required saved-graphics stream");
+            let damaged = dir.join("missing-increments.rvt");
+            std::fs::write(&damaged, compound.into_inner().into_inner())
+                .expect("write private damaged copy");
+            let output = Command::new(env!("CARGO_BIN_EXE_rvt-ifc"))
+                .arg(&damaged)
+                .args(["--mode", "geometry", "--saved-meshes", "-o"])
+                .arg(&ifc)
+                .arg("--diagnostics")
+                .arg(&sidecar)
+                .output()
+                .expect("run saved-graphics refusal export");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(ifc.exists());
+            let diagnostics: rvt::ifc::ExportDiagnostics =
+                serde_json::from_slice(&std::fs::read(&sidecar).expect("read refusal diagnostics"))
+                    .expect("decode refusal diagnostics");
+            assert!(diagnostics.saved_meshes.is_none());
+            assert_eq!(diagnostics.exported.bounding_box_bodies, report.candidates);
+            assert!(
+                diagnostics
+                    .warnings
+                    .iter()
+                    .any(|warning| { warning.starts_with("Saved graphics could not be read;") })
+            );
+            assert_eq!(
+                diagnostics.confidence.warning_count,
+                diagnostics.warnings.len()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]

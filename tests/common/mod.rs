@@ -13,6 +13,8 @@
 
 use std::path::PathBuf;
 
+pub mod project_fixtures;
+
 pub fn samples_dir() -> PathBuf {
     if let Ok(env_dir) = std::env::var("RVT_SAMPLES_DIR") {
         return PathBuf::from(env_dir);

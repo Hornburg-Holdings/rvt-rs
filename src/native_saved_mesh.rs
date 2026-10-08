@@ -16,6 +16,7 @@ pub struct FaceMesh {
     pub normals: Vec<[f64; 3]>,
     #[serde(default)]
     pub analytic_surface: Option<AnalyticCylinder>,
+    /// Saved UV samples concatenated in loop order; topology remains in the graph.
     #[serde(default)]
     pub trim_uv: Vec<[f64; 2]>,
 }
@@ -418,7 +419,7 @@ fn ring(
     face: usize,
     li: usize,
 ) -> Result<Vec<[f64; 2]>> {
-    ring_impl(g, index, face, li, false)
+    ring_impl(g, index, face, li, false, false)
 }
 fn ring_impl(
     g: &ObjectGraph,
@@ -426,6 +427,7 @@ fn ring_impl(
     face: usize,
     li: usize,
     refine_plane: bool,
+    require_isoparametric: bool,
 ) -> Result<Vec<[f64; 2]>> {
     let l = &g.objects[li];
     ensure!(
@@ -471,6 +473,12 @@ fn ring_impl(
             pts.push(point::<2>(&p["uv"][side])?)
         }
         pts.push(point::<2>(&endpoints[1]["uv"][side])?);
+        if require_isoparametric {
+            ensure!(
+                (0..2).any(|axis| { pts.iter().all(|p| (p[axis] - pts[0][axis]).abs() <= 1e-12) }),
+                "nonisoparametric cylinder trim unsupported"
+            );
+        }
         if refine_plane {
             pts = refined_plane_edge(g, index, face, cur, side, pts)?;
         }
@@ -545,7 +553,92 @@ fn tessellation_axis(
     ensure!(values.len() >= 2, "degenerate tessellation axis");
     Ok(values)
 }
-/// Returns no mesh for a face with no trimming boundary (an auxiliary surface).
+
+// Only exact isoparametric intervals are admitted on the additional trim path.
+// Canonicalization uses the existing grid's 1e-12 knot precision; arbitrary
+// sampled curves cannot establish the boundary between their saved samples.
+fn orthogonal_cylinder_loops(loops: &[Vec<[f64; 2]>]) -> Result<Vec<Vec<[f64; 2]>>> {
+    let count = loops.iter().map(Vec::len).sum::<usize>();
+    ensure!(count <= 4096, "cylinder trim validation budget exceeded");
+    let axes: [Vec<f64>; 2] = std::array::from_fn(|k| {
+        let mut values = loops.iter().flatten().map(|p| p[k]).collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        values.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
+        values
+    });
+    let mut normalized = loops.to_vec();
+    for p in normalized.iter_mut().flatten() {
+        for k in 0..2 {
+            let i = axes[k].partition_point(|v| *v < p[k]);
+            let candidate = [i.checked_sub(1), (i < axes[k].len()).then_some(i)]
+                .into_iter()
+                .flatten()
+                .find(|i| (axes[k][*i] - p[k]).abs() <= 1e-12)
+                .context("cylinder trim knot precision mismatch")?;
+            p[k] = axes[k][candidate];
+        }
+    }
+    let mut edges = Vec::with_capacity(count);
+    for (li, r) in normalized.iter().enumerate() {
+        ensure!(area(r).abs() > 1e-12, "degenerate cylinder trim loop");
+        for i in 0..r.len() {
+            let a = r[i];
+            let b = r[(i + 1) % r.len()];
+            ensure!(
+                (a[0] == b[0]) != (a[1] == b[1]),
+                "nonisoparametric cylinder trim unsupported"
+            );
+            ensure!(
+                (a[0] - b[0]).hypot(a[1] - b[1]) > 1e-7,
+                "repeated cylinder trim vertex"
+            );
+            edges.push((li, i, a, b));
+        }
+    }
+    for (ei, &(li, i, a, b)) in edges.iter().enumerate() {
+        for &(lj, j, c, d) in &edges[ei + 1..] {
+            let adjacent = li == lj
+                && ((i + 1) % normalized[li].len() == j || (j + 1) % normalized[li].len() == i);
+            let vertical_ab = a[0] == b[0];
+            let vertical_cd = c[0] == d[0];
+            let between = |v: f64, x: f64, y: f64| v >= x.min(y) && v <= x.max(y);
+            let intersects = if vertical_ab == vertical_cd {
+                let fixed = usize::from(!vertical_ab);
+                let axis = 1 - fixed;
+                let lo = a[axis].min(b[axis]).max(c[axis].min(d[axis]));
+                let hi = a[axis].max(b[axis]).min(c[axis].max(d[axis]));
+                a[fixed] == c[fixed] && if adjacent { lo < hi } else { lo <= hi }
+            } else if vertical_ab {
+                between(a[0], c[0], d[0]) && between(c[1], a[1], b[1]) && !adjacent
+            } else {
+                between(c[0], a[0], b[0]) && between(a[1], c[1], d[1]) && !adjacent
+            };
+            ensure!(!intersects, "intersecting or touching cylinder trim loops");
+        }
+    }
+    Ok(normalized)
+}
+
+fn cylinder_row_intervals(loops: &[Vec<[f64; 2]>], v: f64) -> Result<Vec<[f64; 2]>> {
+    let mut crossings = Vec::new();
+    for r in loops {
+        for i in 0..r.len() {
+            let a = r[i];
+            let b = r[(i + 1) % r.len()];
+            if a[0] == b[0] && v > a[1].min(b[1]) && v < a[1].max(b[1]) {
+                crossings.push(a[0]);
+            }
+        }
+    }
+    crossings.sort_by(f64::total_cmp);
+    ensure!(
+        crossings.len().is_multiple_of(2) && crossings.windows(2).all(|p| p[1] > p[0]),
+        "ambiguous cylinder trim scanline"
+    );
+    Ok(crossings.chunks_exact(2).map(|p| [p[0], p[1]]).collect())
+}
+/// Returns no mesh for a face with no recovered trimming boundary.
+/// A null trim does not establish whether the saved face is physically empty.
 pub fn face(g: &ObjectGraph, fi: usize) -> Result<Option<FaceMesh>> {
     face_indexed(g, &PointerIndex::new(g), fi)
 }
@@ -602,7 +695,7 @@ fn face_indexed(g: &ObjectGraph, index: &PointerIndex<'_>, fi: usize) -> Result<
     let mut seen = BTreeSet::new();
     loop {
         ensure!(seen.insert(li), "loop-list cycle");
-        loops.push(ring_impl(g, index, fi, li, true)?);
+        loops.push(ring_impl(g, index, fi, li, true, false)?);
         match index.resolve(li, &g.objects[li].fields["m_nextLoop"])? {
             Some(next) => li = next,
             None => break,
@@ -777,9 +870,10 @@ pub fn cylinder_face(
         x_vec[2] * y_vec[0] - x_vec[0] * y_vec[2],
         x_vec[0] * y_vec[1] - x_vec[1] * y_vec[0],
     ];
+    let handedness = dot(cross_xy, z_vec);
     ensure!(
-        dot(cross_xy, z_vec) > 1. - 1e-7,
-        "left-handed cylinder basis"
+        handedness.abs() > 1. - 1e-7,
+        "cylinder basis determinant not unit"
     );
     let envelope = surface.fields["m_Envelope"]["m_corners"]
         .as_array()
@@ -806,13 +900,18 @@ pub fn cylinder_face(
     let loop_index = index
         .resolve(fi, &face.fields["m_pFirstLoop"])?
         .context("cylinder trim loop")?;
-    ensure!(
-        index
-            .resolve(loop_index, &g.objects[loop_index].fields["m_nextLoop"])?
-            .is_none(),
-        "multiple cylinder trim loops unsupported"
-    );
-    let trim_uv = ring(g, &index, fi, loop_index)?;
+    let mut loops = Vec::new();
+    let mut seen_loops = BTreeSet::new();
+    let mut li = loop_index;
+    loop {
+        ensure!(seen_loops.insert(li), "cylinder loop-list cycle");
+        loops.push(ring(g, &index, fi, li)?);
+        match index.resolve(li, &g.objects[li].fields["m_nextLoop"])? {
+            Some(next) => li = next,
+            None => break,
+        }
+    }
+    let trim_uv = loops.iter().flatten().copied().collect::<Vec<_>>();
     ensure!(!trim_uv.is_empty(), "empty cylinder trim");
     let mut trim_min = [f64::INFINITY; 2];
     let mut trim_max = [f64::NEG_INFINITY; 2];
@@ -827,59 +926,84 @@ pub fn cylinder_face(
         "degenerate cylinder trim"
     );
     let tol = 1e-7;
-    ensure!(trim_uv.len() >= 4, "nonrectangular cylinder trim");
-    let mut covered = [0.; 4];
-    let mut perimeter = 0.;
-    for (a, b) in trim_uv
-        .iter()
-        .zip(trim_uv.iter().cycle().skip(1))
-        .take(trim_uv.len())
-    {
+    let rectangular = (|| -> Result<()> {
         ensure!(
-            a[0] >= u_range[0] - tol
-                && a[0] <= u_range[1] + tol
-                && a[1] >= v_range[0] - tol
-                && a[1] <= v_range[1] + tol
-                && b[0] >= u_range[0] - tol
-                && b[0] <= u_range[1] + tol
-                && b[1] >= v_range[0] - tol
-                && b[1] <= v_range[1] + tol,
-            "cylinder trim outside envelope"
-        );
-        let du = b[0] - a[0];
-        let dv = b[1] - a[1];
-        let length = du.hypot(dv);
-        ensure!(length > tol, "repeated cylinder trim vertex");
-        ensure!(
-            du.abs() < tol || dv.abs() < tol,
+            loops.len() == 1 && trim_uv.len() >= 4,
             "nonrectangular cylinder trim"
         );
-        let side = if dv.abs() < tol && (a[1] - trim_min[1]).abs() < tol {
-            0
-        } else if du.abs() < tol && (a[0] - trim_max[0]).abs() < tol {
-            1
-        } else if dv.abs() < tol && (a[1] - trim_max[1]).abs() < tol {
-            2
-        } else if du.abs() < tol && (a[0] - trim_min[0]).abs() < tol {
-            3
-        } else {
-            bail!("nonrectangular cylinder trim")
-        };
-        covered[side] += length;
-        perimeter += length;
+        let mut covered = [0.; 4];
+        let mut perimeter = 0.;
+        for (a, b) in trim_uv
+            .iter()
+            .zip(trim_uv.iter().cycle().skip(1))
+            .take(trim_uv.len())
+        {
+            ensure!(
+                a[0] >= u_range[0] - tol
+                    && a[0] <= u_range[1] + tol
+                    && a[1] >= v_range[0] - tol
+                    && a[1] <= v_range[1] + tol
+                    && b[0] >= u_range[0] - tol
+                    && b[0] <= u_range[1] + tol
+                    && b[1] >= v_range[0] - tol
+                    && b[1] <= v_range[1] + tol,
+                "cylinder trim outside envelope"
+            );
+            let du = b[0] - a[0];
+            let dv = b[1] - a[1];
+            let length = du.hypot(dv);
+            ensure!(length > tol, "repeated cylinder trim vertex");
+            ensure!(
+                du.abs() < tol || dv.abs() < tol,
+                "nonrectangular cylinder trim"
+            );
+            let side = if dv.abs() < tol && (a[1] - trim_min[1]).abs() < tol {
+                0
+            } else if du.abs() < tol && (a[0] - trim_max[0]).abs() < tol {
+                1
+            } else if dv.abs() < tol && (a[1] - trim_max[1]).abs() < tol {
+                2
+            } else if du.abs() < tol && (a[0] - trim_min[0]).abs() < tol {
+                3
+            } else {
+                bail!("nonrectangular cylinder trim")
+            };
+            covered[side] += length;
+            perimeter += length;
+        }
+        let expected_perimeter = 2. * ((trim_max[0] - trim_min[0]) + (trim_max[1] - trim_min[1]));
+        ensure!(
+            (perimeter - expected_perimeter).abs() <= tol * expected_perimeter.max(1.),
+            "incomplete or self-intersecting cylinder trim"
+        );
+        ensure!(
+            (covered[0] - (trim_max[0] - trim_min[0])).abs() <= tol
+                && (covered[1] - (trim_max[1] - trim_min[1])).abs() <= tol
+                && (covered[2] - (trim_max[0] - trim_min[0])).abs() <= tol
+                && (covered[3] - (trim_max[1] - trim_min[1])).abs() <= tol,
+            "incomplete cylinder trim perimeter"
+        );
+        Ok(())
+    })()
+    .is_ok();
+    for uv in &trim_uv {
+        ensure!(
+            uv[0] >= u_range[0] - tol
+                && uv[0] <= u_range[1] + tol
+                && uv[1] >= v_range[0] - tol
+                && uv[1] <= v_range[1] + tol,
+            "cylinder trim outside envelope"
+        );
     }
-    let expected_perimeter = 2. * ((trim_max[0] - trim_min[0]) + (trim_max[1] - trim_min[1]));
-    ensure!(
-        (perimeter - expected_perimeter).abs() <= tol * expected_perimeter.max(1.),
-        "incomplete or self-intersecting cylinder trim"
-    );
-    ensure!(
-        (covered[0] - (trim_max[0] - trim_min[0])).abs() <= tol
-            && (covered[1] - (trim_max[1] - trim_min[1])).abs() <= tol
-            && (covered[2] - (trim_max[0] - trim_min[0])).abs() <= tol
-            && (covered[3] - (trim_max[1] - trim_min[1])).abs() <= tol,
-        "incomplete cylinder trim perimeter"
-    );
+    let orthogonal = if rectangular {
+        None
+    } else {
+        for li in seen_loops {
+            ring_impl(g, &index, fi, li, false, true)?;
+        }
+        Some(orthogonal_cylinder_loops(&loops)?)
+    };
+    let grid_trim = orthogonal.as_deref().unwrap_or(&loops);
     // Keep a full-turn trim from collapsing to coincident seam vertices when a
     // deliberately coarse profile is supplied. This is a geometric validity
     // bound, independent of the analytic chord-error policy.
@@ -893,14 +1017,14 @@ pub fn cylinder_face(
         trim_min[0],
         trim_max[0],
         angular_step,
-        trim_uv.iter().map(|p| p[0]),
+        grid_trim.iter().flatten().map(|p| p[0]),
     )
     .context("cylinder tessellation grid too large")?;
     let v_values = tessellation_axis(
         trim_min[1],
         trim_max[1],
         profile.max_v_edge,
-        trim_uv.iter().map(|p| p[1]),
+        grid_trim.iter().flatten().map(|p| p[1]),
     )
     .context("cylinder tessellation grid too large")?;
     const MAX_GRID_VERTICES: usize = 2_000_000;
@@ -921,6 +1045,14 @@ pub fn cylinder_face(
         grid_vertices <= MAX_GRID_VERTICES && grid_triangles <= MAX_GRID_VERTICES * 2,
         "cylinder tessellation grid too large"
     );
+    if orthogonal.is_some() {
+        ensure!(
+            nv.checked_mul(trim_uv.len())
+                .and_then(|work| work.checked_add(grid_triangles / 2))
+                .is_some_and(|work| work <= 16_000_000),
+            "cylinder trim scanline budget exceeded"
+        );
+    }
     let orient = surface.fields["m_orientFlag"]
         .as_bool()
         .context("cylinder orientation")?
@@ -948,7 +1080,10 @@ pub fn cylinder_face(
                 c * x_vec[1] + s * y_vec[1],
                 c * x_vec[2] + s * y_vec[2],
             ];
-            if !orient {
+            // The normal is the oriented parameter-space Jacobian dP/du ×
+            // dP/dv. With an orthonormal reflected frame it is the negative
+            // radial vector; the saved UV winding itself remains unchanged.
+            if orient != (handedness > 0.) {
                 n = [-n[0], -n[1], -n[2]];
             }
             normals.push(n);
@@ -956,8 +1091,25 @@ pub fn cylinder_face(
     }
     let mut triangles = Vec::new();
     let row = nu + 1;
+    let mut filled_uv_area = 0.;
     for j in 0..nv {
+        let intervals = if let Some(loops) = &orthogonal {
+            cylinder_row_intervals(loops, (v_values[j] + v_values[j + 1]) * 0.5)?
+        } else {
+            Vec::new()
+        };
+        let mut interval = 0;
         for i in 0..nu {
+            if orthogonal.is_some() {
+                let u = (u_values[i] + u_values[i + 1]) * 0.5;
+                while interval < intervals.len() && u > intervals[interval][1] {
+                    interval += 1;
+                }
+                if interval == intervals.len() || u < intervals[interval][0] {
+                    continue;
+                }
+            }
+            filled_uv_area += (u_values[i + 1] - u_values[i]) * (v_values[j + 1] - v_values[j]);
             let a = (j * row + i) as u32;
             let b = a + 1;
             let c = a + row as u32;
@@ -968,6 +1120,48 @@ pub fn cylinder_face(
                 triangles.extend([[a, d, b], [a, c, d]]);
             }
         }
+    }
+    if let Some(loops) = &orthogonal {
+        let expected = loops
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let depth = loops
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, other)| *j != i && inside(r[0], other))
+                    .count();
+                area(r).abs() * if depth % 2 == 0 { 1. } else { -1. }
+            })
+            .sum::<f64>();
+        ensure!(
+            expected > 1e-12
+                && !triangles.is_empty()
+                && (filled_uv_area - expected).abs() <= 1e-7 * expected.max(1.),
+            "cylinder trimmed area mismatch"
+        );
+        // Exterior grid points have no incident filled cell. Keep them out of
+        // exported vertex bounds as well as out of the surface triangles.
+        let mut remap = vec![u32::MAX; vertices.len()];
+        for index in triangles.iter().flatten() {
+            remap[*index as usize] = 0;
+        }
+        let mut used_vertices = Vec::new();
+        let mut used_normals = Vec::new();
+        for (i, new_index) in remap.iter_mut().enumerate() {
+            if *new_index != u32::MAX {
+                *new_index = used_vertices.len() as u32;
+                used_vertices.push(vertices[i]);
+                used_normals.push(normals[i]);
+            }
+        }
+        for triangle in &mut triangles {
+            for index in triangle {
+                *index = remap[*index as usize];
+            }
+        }
+        vertices = used_vertices;
+        normals = used_normals;
     }
     Ok(FaceMesh {
         face_index: fi,

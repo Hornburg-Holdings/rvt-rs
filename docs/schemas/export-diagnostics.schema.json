@@ -16,6 +16,50 @@
     "confidence"
   ],
   "properties": {
+    "saved_meshes": {
+      "type": "object",
+      "description": "Present after a requested saved-graphics pass succeeds. Partial means recovered display geometry has unresolved traversal or face diagnostics, not complete physical shape.",
+      "required": [
+        "candidates",
+        "replaced",
+        "triangles",
+        "partial_replaced",
+        "unreplaced",
+        "issues"
+      ],
+      "properties": {
+        "candidates": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replaced": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "triangles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "partial_replaced": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unreplaced": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "issues": {
+          "type": "object",
+          "description": "Element ID keys with missing, ambiguous or partial saved-graphics reasons.",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
     "schema_version": {
       "type": "integer",
       "minimum": 1
@@ -246,7 +290,7 @@
         "properties": {
           "reason": {
             "type": "string",
-            "description": "Machine-readable reason, including unsupported_geometry_* buckets for incomplete element geometry and element_record_without_element_id for element records with no attributable ElementId (RE-30), element_record_without_volume for placed instances with no 3D body, left out as Revit's export leaves them out (#309), and element_record_in_non_primary_design_option for placed instances in a design option other than their set's primary one, also left out as Revit's export leaves them out (RE-40), and element_record_empty_curtain_panel for curtain panels of the Empty System Panel family, left out as Revit's export leaves them out (#309)."
+            "description": "Machine-readable reason, including unsupported_geometry_* buckets for incomplete element geometry and element_record_without_element_id for element records with no attributable ElementId (RE-30), element_record_in_graveyard for historical frames whose owner is uniquely graveyard-only in the schema-decoded index (not a current-model omission), element_record_without_volume for placed instances with no 3D body, left out as Revit's export leaves them out (#309), and element_record_in_non_primary_design_option for placed instances in a design option other than their set's primary one, also left out as Revit's export leaves them out (RE-40), and element_record_empty_curtain_panel for curtain panels of the Empty System Panel family, left out as Revit's export leaves them out (#309)."
           },
           "count": {
             "type": "integer",

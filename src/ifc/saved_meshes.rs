@@ -20,7 +20,7 @@
 //! (`rvt-ifc --saved-meshes`, `rvt-gltf --saved-meshes`).
 
 use super::IfcModel;
-use super::entities::{BrepTriangle, IfcEntity, PropertyValue, SolidShape};
+use super::entities::{BrepTriangle, IfcEntity, Property, PropertyValue, SolidShape};
 use super::export_content::RECORD_BBOX_BODY_SOURCE;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,7 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SAVED_MESH_BODY_SOURCE: &str = "saved_graphics_mesh";
 
 /// What [`attach`] did.
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SavedMeshReport {
     /// Elements whose body was the record's bounding box.
     pub candidates: usize,
@@ -36,6 +37,13 @@ pub struct SavedMeshReport {
     pub replaced: usize,
     /// Triangles written in all.
     pub triangles: usize,
+    /// Replaced bodies whose saved-graphics traversal or tessellation was partial.
+    /// A readable triangle mesh does not establish complete element geometry.
+    pub partial_replaced: usize,
+    /// Candidate bodies left unchanged, including ambiguous duplicate Tags.
+    pub unreplaced: usize,
+    /// Element IDs with missing, ambiguous or partially decoded saved graphics.
+    pub issues: BTreeMap<u64, Vec<String>>,
 }
 
 /// Replace each bounding-box body with the element's saved mesh, where the
@@ -93,20 +101,28 @@ pub fn attach(rf: &mut crate::RevitFile, model: &mut IfcModel) -> anyhow::Result
         max_graph_objects: 1_000_000,
         ..Default::default()
     };
-    let scene = crate::native_saved_scene::extract_at_detail(rf, &options, 3)?;
-    for element in &scene.elements {
-        let Some(indices) = by_id.get(&element.identity.element_id) else {
-            continue;
+    let mut seen = BTreeSet::new();
+    crate::native_saved_scene::extract_meshes_at_detail(rf, &options, 3, |id, meshes| {
+        let Some(indices) = by_id.get(&id) else {
+            return;
         };
+        seen.insert(id);
         // A Tag carried by several entities (a slab's pieces) is ambiguous:
         // leave them as they are.
         let [index] = indices.as_slice() else {
-            continue;
+            report
+                .issues
+                .insert(id, vec!["Element Tag identifies multiple bodies".into()]);
+            return;
         };
-        let primitives = &element.meshes.primitives;
-        if primitives.is_empty() {
-            continue;
+        let mut issues = meshes.diagnostics;
+        if meshes.unbounded_faces > 0 {
+            issues.push(format!(
+                "{} saved faces could not be bounded",
+                meshes.unbounded_faces
+            ));
         }
+        let partial = !issues.is_empty();
         let IfcEntity::BuildingElement {
             location_feet: Some(origin),
             rotation_radians,
@@ -115,12 +131,12 @@ pub fn attach(rf: &mut crate::RevitFile, model: &mut IfcModel) -> anyhow::Result
             ..
         } = &mut model.entities[*index]
         else {
-            continue;
+            return;
         };
         let (sin, cos) = (-rotation_radians.unwrap_or(0.0)).sin_cos();
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
-        for primitive in primitives {
+        for primitive in meshes.primitives {
             let base = vertices.len() as u32;
             vertices.extend(primitive.vertices.iter().map(|p| {
                 let (dx, dy) = (p[0] - origin[0], p[1] - origin[1]);
@@ -135,9 +151,15 @@ pub fn attach(rf: &mut crate::RevitFile, model: &mut IfcModel) -> anyhow::Result
             );
         }
         if triangles.is_empty() {
-            continue;
+            issues.push("No saved surface triangles were recovered".into());
+            report.issues.insert(id, issues);
+            return;
         }
         report.replaced += 1;
+        if partial {
+            report.partial_replaced += 1;
+            report.issues.insert(id, issues);
+        }
         report.triangles += triangles.len();
         *solid_shape = Some(SolidShape::TriangulatedFaceSet {
             vertices_feet: vertices,
@@ -148,6 +170,17 @@ pub fn attach(rf: &mut crate::RevitFile, model: &mut IfcModel) -> anyhow::Result
                 property.value = PropertyValue::Text(SAVED_MESH_BODY_SOURCE.into());
             }
         }
+        set.properties.push(Property {
+            name: "SavedGraphicsPartial".into(),
+            value: PropertyValue::Boolean(partial),
+        });
+    })?;
+    for &id in by_id.keys().filter(|id| !seen.contains(id)) {
+        report.issues.insert(
+            id,
+            vec!["No current saved-graphics record was recovered".into()],
+        );
     }
+    report.unreplaced = report.candidates - report.replaced;
     Ok(report)
 }

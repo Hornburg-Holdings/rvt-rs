@@ -333,6 +333,24 @@ impl StepWriter {
         set_gid: &str,
         rel_gid: &str,
     ) {
+        let set_id = self.emit_property_set_definition(owner_hist, pset, set_gid);
+        let rel_id = self.id();
+        self.emit_entity(
+            rel_id,
+            format!(
+                "IFCRELDEFINESBYPROPERTIES('{rel_gid}',#{owner_hist},$,$,(#{object}),#{set_id})"
+            ),
+        );
+    }
+
+    /// A type owns its property sets through `HasPropertySets`, without an
+    /// occurrence `IfcRelDefinesByProperties` relationship.
+    fn emit_property_set_definition(
+        &mut self,
+        owner_hist: usize,
+        pset: &PropertySet,
+        set_gid: &str,
+    ) -> usize {
         let mut prop_ids: Vec<usize> = Vec::with_capacity(pset.properties.len());
         for prop in &pset.properties {
             let p_id = self.id();
@@ -357,13 +375,7 @@ impl StepWriter {
             set_id,
             format!("IFCPROPERTYSET('{set_gid}',#{owner_hist},'{set_name}',$,({refs}))"),
         );
-        let rel_id = self.id();
-        self.emit_entity(
-            rel_id,
-            format!(
-                "IFCRELDEFINESBYPROPERTIES('{rel_gid}',#{owner_hist},$,$,(#{object}),#{set_id})"
-            ),
-        );
+        set_id
     }
 
     /// Emit one `IfcProfileDef` subclass from an [`Extrusion`],
@@ -2915,11 +2927,12 @@ impl StepWriter {
                     })
                 })
             };
-            let (Some(family), Some(type_name)) = (
-                property_text(super::export_content::FAMILY_NAME_PROPERTY),
-                property_text(super::export_content::TYPE_NAME_PROPERTY),
-            ) else {
+            let Some(type_name) = property_text(super::export_content::TYPE_NAME_PROPERTY) else {
                 continue;
+            };
+            let name = match property_text(super::export_content::FAMILY_NAME_PROPERTY) {
+                Some(family) => format!("{family}:{type_name}"),
+                None => type_name,
             };
             let Some((entity_name, tail)) =
                 type_entity_for(&ifc_type.to_ascii_uppercase(), predefined_type.as_deref())
@@ -2951,7 +2964,7 @@ impl StepWriter {
                 None => type_groups.push(TypeGroup {
                     type_id: *type_id,
                     entity: entity_name,
-                    name: format!("{family}:{type_name}"),
+                    name,
                     tail,
                     predefined: predefined_type
                         .as_deref()
@@ -2961,6 +2974,14 @@ impl StepWriter {
                     first_element: element_id,
                     elements: vec![el_id],
                 }),
+            }
+        }
+        let mut type_property_sets: BTreeMap<u32, Vec<&PropertySet>> = BTreeMap::new();
+        for entity in &model.entities {
+            if let super::entities::IfcEntity::TypePropertySet { type_id, set } = entity {
+                if !set.properties.is_empty() {
+                    type_property_sets.entry(*type_id).or_default().push(set);
+                }
             }
         }
         // B73: of the type objects a type is written as, the one holding its
@@ -3015,11 +3036,32 @@ impl StepWriter {
                 Some(global_id) if used_gids.insert(global_id.clone()) => global_id,
                 _ => gid(&["type", entity_name, &tag]),
             };
+            let mut property_set_refs = Vec::new();
+            if let Some(sets) = type_property_sets.get(type_id) {
+                for (occurrence, set) in sets.iter().enumerate() {
+                    let set_id = self.emit_property_set_definition(
+                        owner_hist,
+                        set,
+                        &gid(&[
+                            "type-property-set",
+                            &type_gid,
+                            &set.name,
+                            &occurrence.to_string(),
+                        ]),
+                    );
+                    property_set_refs.push(format!("#{set_id}"));
+                }
+            }
+            let property_sets = if property_set_refs.is_empty() {
+                "$".to_owned()
+            } else {
+                format!("({})", property_set_refs.join(","))
+            };
             let type_el_id = self.id();
             self.emit_entity(
                 type_el_id,
                 format!(
-                    "{entity_name}('{type_gid}',#{owner_hist},{},$,$,$,$,'{tag}',$,{tail})",
+                    "{entity_name}('{type_gid}',#{owner_hist},{},$,$,{property_sets},$,'{tag}',$,{tail})",
                     quoted_or_dollar(&escape(name)),
                 ),
             );
